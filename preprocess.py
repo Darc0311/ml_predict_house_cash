@@ -1,21 +1,51 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[5]:
+
+
 import os
 import re
 import glob
 import pandas as pd
+from __future__ import annotations
 
 
 # Возможные варианты написания заголовка колонки со ссылкой
 ID_COLUMN_CANDIDATES = ["sNO6x href", "sNO6x  href", "href"]
 
+# Точные названия колонок с признаками (как в файле)
+COLUMN_MAP = {
+    "area":         ["s6KKu 2"],
+    "rooms":        ["s6KKu"],
+    "floor":        ["s6KKu 3"],
+    "metro_minutes":["si5bH"],
+    "price":        ["s5oAg"],
+}
+
+
+def _norm(s: str) -> str:
+    """Нормализация заголовка: нижний регистр, схлопывание пробелов."""
+    return re.sub(r"\s+", " ", str(s)).strip().lower()
+
+
+def _find_column_by_names(df, candidates: list[str]) -> int | None:
+    """Ищет индекс колонки по точному (нормализованному) совпадению заголовка."""
+    cand_norm = {_norm(c) for c in candidates}
+    for col_idx in df.columns:
+        for row_idx in range(len(df)):  # Ограничение на данные изначально было: range(min(5, len(df)))
+            cell = _norm(df.iat[row_idx, col_idx])
+            if cell in cand_norm:
+                return col_idx
+    return None
+
 
 def find_id_column(df: pd.DataFrame) -> int | None:
     """Ищет индекс колонки, содержащей ссылки на объявления domclick."""
     # 1. По точному совпадению заголовка в первых строках
-    for col_idx in df.columns:
-        for row_idx in range(min(5, len(df))):
-            cell = str(df.iat[row_idx, col_idx]).strip().lower()
-            if cell in [c.lower() for c in ID_COLUMN_CANDIDATES]:
-                return col_idx
+    col = _find_column_by_names(df, ID_COLUMN_CANDIDATES)
+    if col is not None:
+        return col
 
     # 2. Fallback: ищем колонку, где большинство значений — ссылки на domclick card
     for col_idx in df.columns:
@@ -27,6 +57,14 @@ def find_id_column(df: pd.DataFrame) -> int | None:
             return col_idx
 
     return None
+
+
+def find_feature_columns(df: pd.DataFrame) -> dict[str, int | None]:
+    """Ищет индексы колонок для каждого признака по названиям."""
+    result = {}
+    for feat, names in COLUMN_MAP.items():
+        result[feat] = _find_column_by_names(df, names)
+    return result
 
 
 def extract_id_from_url(text: str) -> str | None:
@@ -42,42 +80,87 @@ def extract_id_from_url(text: str) -> str | None:
     return None
 
 
-def extract_features_from_text(text: str) -> dict:
-    """Извлекает признаки (кроме id) из склеенного текста строки."""
-    result = {
-        "rooms": None,
-        "area": None,
-        "floor": None,
-        "total_floors": None,
-        "price": None,
-    }
-    if not isinstance(text, str):
-        return result
+# ---------- Парсеры отдельных признаков ----------
 
+def parse_area(text: str) -> float | None:
+    """Площадь (вещественное число). Пример: '50,1 м²' -> 50.1"""
+    if not isinstance(text, str):
+        return None
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*м[²2]?", text)
+    if m:
+        try:
+            return float(m.group(1).replace(",", "."))
+        except ValueError:
+            return None
+    # если единиц нет — пробуем взять просто число
+    m = re.search(r"(\d+(?:[.,]\d+)?)", text)
+    if m:
+        try:
+            return float(m.group(1).replace(",", "."))
+        except ValueError:
+            return None
+    return None
+
+
+def parse_rooms(text: str) -> int | None:
+    """Кол-во комнат. Пример: '3-комн. квартира' -> 3, 'Студия' -> 0"""
+    if not isinstance(text, str):
+        return None
     m = re.search(r"(\d+)\s*-\s*комн", text, re.IGNORECASE)
     if m:
-        result["rooms"] = int(m.group(1))
-    elif re.search(r"студи", text, re.IGNORECASE):
-        result["rooms"] = 0
+        return int(m.group(1))
+    if re.search(r"студи", text, re.IGNORECASE):
+        return 0
+    return None
 
-    m = re.search(r"(\d+(?:[.,]\d+)?)\s*м[²2]", text)
-    if m:
-        result["area"] = float(m.group(1).replace(",", "."))
 
-    m = re.search(r"(\d+)\s*/\s*(\d+)\s*эт", text)
+def parse_floor(text: str) -> tuple[int | None, int | None]:
+    """Этаж/всего этажей. Пример: '8/9 эт.' -> (8, 9)"""
+    if not isinstance(text, str):
+        return None, None
+    m = re.search(r"(\d+)\s*/\s*(\d+)", text)
     if m:
-        result["floor"] = int(m.group(1))
-        result["total_floors"] = int(m.group(2))
+        return int(m.group(1)), int(m.group(2))
+    return None, None
 
-    m = re.search(r"([\d\s\u00a0\u202f]+)\s*₽", text)
+
+def parse_metro_minutes(text: str) -> int | None:
+    """Время до метро (целое число минут). Пример: '~18 мин.' -> 18"""
+    if not isinstance(text, str):
+        return None
+    m = re.search(r"(\d+)\s*мин", text, re.IGNORECASE)
     if m:
-        price_str = re.sub(r"[\s\u00a0\u202f]", "", m.group(1))
+        return int(m.group(1))
+    m = re.search(r"(\d+)", text)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def parse_price(text: str) -> float | None:
+    """Цена (вещественное число). Пример: '17 900 000 ₽' -> 17900000.0"""
+    if not isinstance(text, str):
+        return None
+    # убираем пробелы (включая неразрывные) и знак рубля
+    cleaned = re.sub(r"[\s\u00a0\u202f₽]", "", text)
+    # берём первое число (возможно с дробной частью)
+    m = re.search(r"(\d+(?:[.,]\d+)?)", cleaned)
+    if m:
         try:
-            result["price"] = int(price_str)
+            return float(m.group(1).replace(",", "."))
         except ValueError:
-            pass
+            return None
+    return None
 
-    return result
+
+def _get_cell(row: pd.Series, col_idx: int | None) -> str:
+    """Безопасно достаёт значение ячейки по индексу колонки."""
+    if col_idx is None:
+        return ""
+    try:
+        return str(row.iloc[col_idx])
+    except (IndexError, KeyError):
+        return ""
 
 
 def process_excel_file(path: str) -> pd.DataFrame:
@@ -90,20 +173,29 @@ def process_excel_file(path: str) -> pd.DataFrame:
         print(f"  ⚠ не найдена колонка со ссылкой в {os.path.basename(path)}")
         return pd.DataFrame()
 
+    feat_cols = find_feature_columns(df)
+    missing = [f for f, c in feat_cols.items() if c is None]
+    if missing:
+        print(f"  ⚠ не найдены колонки для признаков: {', '.join(missing)} "
+              f"(в {os.path.basename(path)})")
+
     rows = []
     for _, row in df.iterrows():
-        id_value = extract_id_from_url(str(row.iloc[id_col]))
+        id_value = extract_id_from_url(_get_cell(row, id_col))
         if id_value is None:
             continue  # пропускаем строки без id (шапка, пустые и т.п.)
 
-        # Для остальных признаков склеиваем все ячейки, КРОМЕ колонки со ссылкой
-        other_text = " | ".join(
-            str(v) for i, v in enumerate(row.values)
-            if i != id_col and str(v).strip()
-        )
-        feats = extract_features_from_text(other_text)
-        feats["id"] = id_value
-        feats["source_file"] = os.path.basename(path)
+        floor, total_floors = parse_floor(_get_cell(row, feat_cols["floor"]))
+        feats = {
+            "id": id_value,
+            "rooms": parse_rooms(_get_cell(row, feat_cols["rooms"])),
+            "area": parse_area(_get_cell(row, feat_cols["area"])),
+            "floor": floor,
+            "total_floors": total_floors,
+            "metro_minutes": parse_metro_minutes(_get_cell(row, feat_cols["metro_minutes"])),
+            "price": parse_price(_get_cell(row, feat_cols["price"])),
+            "source_file": os.path.basename(path),
+        }
         rows.append(feats)
 
     return pd.DataFrame(rows)
@@ -133,7 +225,8 @@ def main(folder: str, out_dir: str = "features", out_name: str = "all_features.c
         return
 
     result = pd.concat(all_frames, ignore_index=True)
-    cols = ["id", "rooms", "area", "floor", "total_floors", "price", "source_file"]
+    cols = ["id", "rooms", "area", "floor", "total_floors",
+            "metro_minutes", "price", "source_file"]
     result = result[cols]
 
     if result["id"].notna().any():
@@ -149,4 +242,4 @@ def main(folder: str, out_dir: str = "features", out_name: str = "all_features.c
 
 if __name__ == "__main__":
     main(folder="./data", out_dir="./features")
-    
+
